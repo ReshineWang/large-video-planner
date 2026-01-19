@@ -27,7 +27,7 @@ class WanImageToVideo(WanTextToVideo):
             pretrained=False,
             return_transforms=True,
             return_tokenizer=False,
-            dtype=torch.float16 if self.is_inference else self.dtype,
+            dtype=torch.bfloat16 if self.is_inference else self.dtype,
             device="cpu",
         )
         if self.cfg.clip.ckpt_path is not None:
@@ -42,15 +42,28 @@ class WanImageToVideo(WanTextToVideo):
         self.clip_normalize = clip_transform.transforms[-1]
 
     def configure_optimizers(self):
+        # We manually filter parameters that require gradients to avoid DeepSpeed bugs 
+        # where flattening an empty list (because all params in a group are frozen) causes a crash.
+        model_params = [p for p in self.model.parameters() if p.requires_grad]
+        vae_params = [p for p in self.vae.parameters() if p.requires_grad]
+        clip_params = [p for p in self.clip.parameters() if p.requires_grad]
+
+        groups = [
+             {"params": model_params, "lr": self.cfg.lr}
+        ]
+        
+        # Only add other groups if they have trainable parameters
+        if len(vae_params) > 0:
+            groups.append({"params": vae_params, "lr": 0})
+        if len(clip_params) > 0:
+             groups.append({"params": clip_params, "lr": 0})
+
         optimizer = torch.optim.AdamW(
-            [
-                {"params": self.model.parameters(), "lr": self.cfg.lr},
-                {"params": self.vae.parameters(), "lr": 0},
-                {"params": self.clip.parameters(), "lr": 0},
-            ],
+            groups,
             weight_decay=self.cfg.weight_decay,
             betas=self.cfg.betas,
         )
+
         # optimizer = torch.optim.AdamW(
         #     self.model.parameters(),
         #     lr=self.cfg.lr,

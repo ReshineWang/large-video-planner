@@ -671,11 +671,7 @@ class WanVAE_(nn.Module):
         self._enc_feat_map = [None] * self._enc_conv_num
 
 
-def video_vae_factory(pretrained_path=None, z_dim=None, device="cpu", **kwargs):
-    """
-    Autoencoder3d adapted from Stable Diffusion 1.x, 2.x and XL.
-    """
-    # params
+def video_vae_factory(pretrained_path=None, z_dim=None, **kwargs):
     cfg = dict(
         dim=96,
         z_dim=z_dim,
@@ -687,17 +683,12 @@ def video_vae_factory(pretrained_path=None, z_dim=None, device="cpu", **kwargs):
     )
     cfg.update(**kwargs)
 
-    # init model
-    # with torch.device("meta"):
-    model = WanVAE_(**cfg)
+    model = WanVAE_(**cfg).cpu()
 
-    # load checkpoint
     if pretrained_path is not None:
-        # logging.info(f"loading {pretrained_path}")
-        model.load_state_dict(
-            torch.load(pretrained_path, map_location=device, weights_only=True),
-            assign=True,
-        )
+        ckpt = torch.load(pretrained_path, map_location="cpu", weights_only=True)
+        model.load_state_dict(ckpt, strict=True)  # assign=False 默认
+    return model
 
     return model
 

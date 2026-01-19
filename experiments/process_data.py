@@ -16,6 +16,7 @@ from datasets.pandas import PandasVideoDataset
 from datasets.ego4d import Ego4DVideoDataset
 from datasets.mixture import MixtureDataset
 from datasets.agibot_world import AgibotWorldDataset
+from datasets.robotwin import RobotwinDataset
 from .exp_base import BaseExperiment
 
 
@@ -42,6 +43,7 @@ class ProcessDataExperiment(BaseExperiment):
         ego4d=Ego4DVideoDataset,
         bridge=OpenXVideoDataset,
         droid=DroidVideoDataset,
+        robotwin=RobotwinDataset,
         agibot_world=AgibotWorldDataset,
         language_table=OpenXVideoDataset,
         # austin_buds=OpenXVideoDataset,
@@ -184,9 +186,53 @@ class ProcessDataExperiment(BaseExperiment):
         if self.cfg.num_nodes != 1:
             raise ValueError("This script only supports 1 node. ")
 
-        from algorithms.cogvideo.t5 import T5Encoder
+        if "wan" in self.root_cfg.algorithm._name:
+            from algorithms.wan.modules.t5 import umt5_xxl
+            from algorithms.wan.modules.tokenizers import HuggingfaceTokenizer
 
-        t5_encoder = T5Encoder(self.root_cfg.algorithm).cuda()
+            class WanT5EncoderWrapper:
+                def __init__(self, cfg):
+                    self.cfg = cfg
+                    self.device = "cuda"
+                    
+                    print(f"Initializing Wan T5 Encoder with dtype bf16")
+                    self.text_encoder = umt5_xxl(
+                        encoder_only=True,
+                        return_tokenizer=False,
+                        dtype=torch.bfloat16,
+                        device=torch.device("cpu")
+                    ).eval().requires_grad_(False)
+                    
+                    if cfg.text_encoder.ckpt_path:
+                         print(f"Loading T5 from {cfg.text_encoder.ckpt_path}")
+                         sd = torch.load(cfg.text_encoder.ckpt_path, map_location="cpu", weights_only=True)
+                         self.text_encoder.load_state_dict(sd)
+                    else:
+                         print("WARNING: No T5 ckpt_path provided in config! Using random weights if not using HF Hub.")
+                    
+                    self.text_encoder = self.text_encoder.to(self.device)
+                    
+                    self.tokenizer = HuggingfaceTokenizer(
+                        name=cfg.text_encoder.name,
+                        seq_len=cfg.text_encoder.text_len,
+                        clean="whitespace",
+                    )
+                
+                @torch.no_grad()
+                def predict(self, prompts):
+                    ids, mask = self.tokenizer(prompts, return_mask=True, add_special_tokens=True)
+                    ids = ids.to(self.device)
+                    mask = mask.to(self.device)
+                    seq_lens = mask.gt(0).sum(dim=1).long()
+                    context = self.text_encoder(ids, mask)
+                    return [u[:v].cpu() for u, v in zip(context, seq_lens)]
+            
+            t5_encoder = WanT5EncoderWrapper(self.root_cfg.algorithm)
+
+        else:
+            from algorithms.cogvideo.t5 import T5Encoder
+            t5_encoder = T5Encoder(self.root_cfg.algorithm).cuda()
+
         dataset = self._build_dataset()
         records = dataset.records
 
@@ -199,7 +245,9 @@ class ProcessDataExperiment(BaseExperiment):
         for i in trange(0, len(records), batch_size):
             batch = records[i : i + batch_size]
             prompts = [dataset.id_token + r["caption"] for r in batch]
-            embeds = t5_encoder.predict(prompts).cpu()
+            embeds = t5_encoder.predict(prompts)
+            if hasattr(embeds, "cpu"):
+                embeds = embeds.cpu()
             for r, embed in zip(batch, embeds):
                 video_path = Path(r["video_path"])
                 prompt_embed_path = (

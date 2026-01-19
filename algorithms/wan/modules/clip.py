@@ -54,7 +54,13 @@ class QuickGELU(nn.Module):
 class LayerNorm(nn.LayerNorm):
 
     def forward(self, x):
-        return super().forward(x.float()).type_as(x)
+        return F.layer_norm(
+            x.float(),
+            self.normalized_shape,
+            self.weight.float() if self.weight is not None else None,
+            self.bias.float() if self.bias is not None else None,
+            self.eps,
+        ).type_as(x)
 
 
 class SelfAttention(nn.Module):

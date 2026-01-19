@@ -91,6 +91,7 @@ class WanTextToVideo(BasePytorchAlgo):
 
     def configure_model(self):
         logging.info("Building model...")
+        print(f"[DEBUG] configure_model called. is_inference={self.is_inference}, self.training={self.training}")
         # Initialize text encoder
         if not self.cfg.load_prompt_embed:
             text_encoder = (
@@ -133,12 +134,13 @@ class WanTextToVideo(BasePytorchAlgo):
             )
             .eval()
             .requires_grad_(False)
-        ).to(self.dtype)
+        ).to(torch.bfloat16 if self.is_inference else self.dtype)
+        print( f"self.dtype: {self.dtype}")
         self.register_buffer(
-            "vae_mean", torch.tensor(self.cfg.vae.mean, dtype=self.dtype)
+            "vae_mean", torch.tensor(self.cfg.vae.mean, dtype=torch.bfloat16 if self.is_inference else self.dtype)
         )
         self.register_buffer(
-            "vae_inv_std", 1.0 / torch.tensor(self.cfg.vae.std, dtype=self.dtype)
+            "vae_inv_std", 1.0 / torch.tensor(self.cfg.vae.std, dtype=torch.bfloat16 if self.is_inference else self.dtype)
         )
         self.vae_scale = [self.vae_mean, self.vae_inv_std]
         if self.cfg.vae.compile:
@@ -156,6 +158,25 @@ class WanTextToVideo(BasePytorchAlgo):
             self.model.load_state_dict(
                 self._load_tuned_state_dict(), assign=not self.is_inference
             )
+            
+            # [Fix] Force parameters to require gradients if this is loaded for training
+            # Moving this OUTSIDE the is_inference check for debugging, or relying on correctly detected state.
+            # If load_state_dict with assign=True was used, params are frozen.
+            # If standard load_state_dict was used, params might be consistent with initialization.
+            # We explicitly check and unfreeze if we are in training mode or just to be safe for DeepSpeed.
+            print(f"[DEBUG] Model loaded. Checking parameters... is_inference={self.is_inference}")
+            tune_params = list(self.model.parameters())
+            trainable = [p for p in tune_params if p.requires_grad]
+            total_elements = sum(p.numel() for p in tune_params)
+            trainable_elements = sum(p.numel() for p in trainable)
+            print(f"[DEBUG] Total params (elements): {total_elements/1e9:.2f} B, Trainable (elements): {trainable_elements/1e9:.2f} B")
+            print(f"[DEBUG] Total params (tensors): {len(tune_params)}, Trainable (tensors): {len(trainable)}")
+            
+            if len(trainable) == 0:
+                print("[DEBUG] No trainable parameters found! Forcing requires_grad=True for model parameters.")
+                for p in self.model.parameters():
+                    p.requires_grad_(True)
+
             # self.model = WanModel(
             #     model_type=self.cfg.model.model_type,
             #     patch_size=self.cfg.model.patch_size,
@@ -175,6 +196,9 @@ class WanTextToVideo(BasePytorchAlgo):
             # )
         if not self.is_inference:
             self.model.to(self.dtype).train()
+            # Ensure parameters require gradients (assign=True in load_state_dict may freeze them)
+            for p in self.model.parameters():
+                p.requires_grad_(True)
         if self.gradient_checkpointing_rate > 0:
             self.model.gradient_checkpointing_enable(p=self.gradient_checkpointing_rate)
         if self.cfg.model.compile:
@@ -456,10 +480,12 @@ class WanTextToVideo(BasePytorchAlgo):
             seq_len=self.max_tokens,
             y=image_embeds,
         )
-        loss = torch.nn.functional.mse_loss(flow_pred, flow)
+        
+        # Cast target to the same dtype as the prediction to ensure correct gradient types for DeepSpeed
+        loss = torch.nn.functional.mse_loss(flow_pred, flow.to(flow_pred.dtype))
 
         if self.global_step % self.cfg.logging.loss_freq == 0:
-            self.log("train/loss", loss, sync_dist=True)
+            self.log("train/loss", loss, sync_dist=True, prog_bar=True)
 
         return loss
 
@@ -487,6 +513,17 @@ class WanTextToVideo(BasePytorchAlgo):
         image_embeds = batch["image_embeds"]
         prompt_embeds = batch["prompt_embeds"]
         video_lat = batch["video_lat"]
+
+        # Ensure all tensors are compatible with the model's dtype
+        target_dtype = self.model.patch_embedding.weight.dtype
+        if video_lat.dtype != target_dtype:
+             video_lat = video_lat.to(target_dtype)
+        if clip_embeds is not None and clip_embeds.dtype != target_dtype:
+             clip_embeds = clip_embeds.to(target_dtype)
+        if image_embeds is not None and image_embeds.dtype != target_dtype:
+             image_embeds = image_embeds.to(target_dtype)
+        if prompt_embeds is not None:
+             prompt_embeds = [u.to(target_dtype) if u.dtype != target_dtype else u for u in prompt_embeds]
 
         batch_size = video_lat.shape[0]
 
@@ -573,7 +610,8 @@ class WanTextToVideo(BasePytorchAlgo):
         if self.cfg.logging.video_type == "single":
             video_vis = video_pred.cpu()
         else:
-            video_vis = torch.cat([video_pred, video_gt], dim=-1).cpu()
+            # Modified: GT on top, Pred on bottom
+            video_vis = torch.cat([video_gt, video_pred], dim=-2).cpu()
         video_vis = video_vis * 0.5 + 0.5
         video_vis = rearrange(self.all_gather(video_vis), "p b ... -> (p b) ...")
 

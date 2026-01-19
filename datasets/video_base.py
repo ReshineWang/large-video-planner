@@ -304,7 +304,21 @@ class VideoDataset(Dataset):
         Require these entries: "video_path", "caption", "height", "width", "n_frames", "fps"
         Optional entry: "split" - if present, will be used instead of test_percentage
         """
-
+        # # === DEBUG: FORCED FAKE RECORDS ===
+        # print(f"WARNING: Generating FAKE data records for debugging.")
+        # return [
+        #     {
+        #         "video_path": "FAKE",
+        #         "caption": "debug fake video",
+        #         "height": self.height,
+        #         "width": self.width,
+        #         "n_frames": self.n_frames,
+        #         "fps": self.fps,
+        #         "split": self.split,
+        #     }
+        #     for _ in range(128)
+        # ]
+    
         records = pd.read_csv(self.data_root / self.metadata_path, na_filter=False)
         records = records.to_dict("records")
         len_pre_filter = len(records)
@@ -329,13 +343,37 @@ class VideoDataset(Dataset):
         if self.split != "all":
             if "split" in records[0]:
                 # Use split field from records
+                # 如果 CSV 里有 split 列，按列划分 (Robotwin 没有这一列)
                 records = [r for r in records if r["split"] == self.split]
             else:
-                # Use test_percentage
+                # Random split logic
+                all_indices = list(range(len(records)))
+                # Fix seed for consistency between train/val dataset instantiation
+                random.Random(0).shuffle(all_indices)
+
+                num_test = int(len(records) * self.test_percentage)
                 if self.split == "training":
-                    records = records[: -int(len(records) * self.test_percentage)]
+                    split_indices = all_indices[:-num_test] if num_test > 0 else all_indices
                 else:  # validation/test
-                    records = records[-int(len(records) * self.test_percentage) :]
+                    split_indices = all_indices[-num_test:] if num_test > 0 else []
+
+                records = [records[i] for i in split_indices]
+
+                # Record split indices
+                try:
+                    from hydra.core.hydra_config import HydraConfig
+                    if HydraConfig.initialized():
+                        output_dir = Path(HydraConfig.get().runtime.output_dir)
+                    else:
+                        output_dir = Path.cwd()
+                    
+                    save_path = output_dir / f"{self.split}_split_indices.txt"
+                    print(f"Saving {len(split_indices)} {self.split} indices to {save_path}")
+                    with open(save_path, "w") as f:
+                        for idx in sorted(split_indices):
+                            f.write(f"{idx}\n")
+                except Exception as e:
+                    print(f"Failed to record split indices: {e}")
 
         if not records:
             raise ValueError(

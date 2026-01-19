@@ -568,7 +568,9 @@ class WanModel(ModelMixin, ConfigMixin):
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
         # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        # Fix: Cast input to the same dtype as the patch_embedding weights (BF16)
+        x_dtype = self.patch_embedding.weight.dtype
+        x = [self.patch_embedding(u.unsqueeze(0).to(x_dtype)) for u in x]
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x]
         )

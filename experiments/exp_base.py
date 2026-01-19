@@ -310,6 +310,7 @@ class BaseLightningExperiment(BasePytorchExperiment):
             strategy=self._build_strategy(),
             callbacks=callbacks,
             gradient_clip_val=self.cfg.training.optim.gradient_clip_val,
+            gradient_clip_algorithm=self.cfg.training.optim.get("gradient_clip_algorithm", "norm"),
             val_check_interval=self.cfg.validation.val_every_n_step,
             limit_val_batches=self.cfg.validation.limit_batch,
             check_val_every_n_epoch=self.cfg.validation.val_every_n_epoch,
@@ -321,6 +322,7 @@ class BaseLightningExperiment(BasePytorchExperiment):
             max_steps=self.cfg.training.max_steps,
             max_time=self.cfg.training.max_time,
             deterministic=True,
+            log_every_n_steps=1,
         )
 
         # if self.debug:
